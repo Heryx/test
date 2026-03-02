@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from typing import Any, Callable
+import io
+import json
+import zipfile
 
 import numpy as np
 import plotly.graph_objects as go
@@ -8,6 +11,7 @@ import streamlit as st
 from scipy.interpolate import griddata
 from scipy.ndimage import median_filter
 from scipy.spatial import cKDTree
+from plotly.subplots import make_subplots
 
 from radar_filters import (
     apply_linear_interpolation_3d_cube,
@@ -18,6 +22,7 @@ from radar_filters import (
     normalize_for_display,
 )
 from radar_io import OgprProfile
+from gpr_app.metadata_validator import validate_metadata
 
 
 def _normalize_with_fixed_bounds(data: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
@@ -63,33 +68,26 @@ def _corr_flat(a: np.ndarray, b: np.ndarray) -> float:
 
 def _get_profile_axes(profile: OgprProfile, y_axis_mode: str) -> dict[str, Any]:
     """Calcola i valori e i titoli per gli assi X e Y del radargramma."""
-    # --- Asse X (Distanza o Traccia) ---
     x_axis_vals = np.arange(profile.data.shape[0])
     x_axis_title = "Traccia"
     if profile.x is not None and profile.y is not None and profile.x.size > 1 and profile.y.size > 1:
         x_coords = np.asarray(profile.x, dtype=np.float64)
         y_coords = np.asarray(profile.y, dtype=np.float64)
-
         finite_mask = np.isfinite(x_coords) & np.isfinite(y_coords)
         if np.count_nonzero(finite_mask) > 1:
             x_finite = x_coords[finite_mask]
             y_finite = y_coords[finite_mask]
-
             distances = np.sqrt(np.diff(x_finite) ** 2 + np.diff(y_finite) ** 2)
             cumulative_dist_finite = np.concatenate(([0], np.cumsum(distances)))
-
             original_indices = np.arange(profile.data.shape[0])
             finite_indices = original_indices[finite_mask]
-
             if len(finite_indices) > 1:
                 x_axis_vals = np.interp(original_indices, finite_indices, cumulative_dist_finite)
                 x_axis_title = "Distanza (m)"
 
-    # --- Asse Y (Campioni, Tempo o Profondità) ---
     samples_count = profile.data.shape[1]
     y_axis_vals = np.arange(samples_count)
     y_axis_title = "Campioni (samples)"
-
     radar_params = profile.metadata.get("radar_parameters", {})
     sampling_time_ns = radar_params.get("samplingTime_ns")
 
@@ -182,6 +180,277 @@ def _coordinates_for_profile(
     return x, y, False
 
 
+def render_multi_profile_tab(
+    profiles: list[OgprProfile],
+    cfg: Any,
+    viz: Any,
+    ordered_processing_steps: Callable[[Any], list[tuple[str, int]]],
+    run_filter_pipeline_cb: Callable[[np.ndarray, Any], list[tuple[str, np.ndarray]]],
+    apply_filters_cb: Callable[[np.ndarray, Any], np.ndarray],
+) -> None:
+    """Vista multi-profilo con comparazione side-by-side ed export batch."""
+    st.markdown("### 📊 Vista Multi-Profilo Comparativa")
+    
+    mode_label = "Base consigliato" if cfg.workflow_mode == "base" else "Manuale"
+    st.caption(f"Modalità workflow: {mode_label}")
+    
+    # Profile selection
+    profile_options = {f"{p.label} ({p.file_name}, ch{p.channel_index})": i for i, p in enumerate(profiles)}
+    
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        selected_labels = st.multiselect(
+            "🎯 Seleziona profili da comparare (max 4)",
+            options=list(profile_options.keys()),
+            default=[list(profile_options.keys())[0]] if profile_options else [],
+            max_selections=4,
+        )
+    
+    with col2:
+        view_mode = st.radio(
+            "Modalità vista",
+            options=["Side-by-side", "Griglia"],
+            index=0,
+        )
+    
+    selected_indices = [profile_options[label] for label in selected_labels]
+    selected_profiles = [profiles[i] for i in selected_indices]
+    
+    if not selected_profiles:
+        st.info("👆 Seleziona almeno un profilo per visualizzare la comparazione.")
+        return
+    
+    # Common controls
+    y_axis_mode = st.radio(
+        "Asse Y Radargrammi",
+        ["Campioni (samples)", "Tempo (ns)", "Profondità (m)"],
+        index=1,
+        horizontal=True,
+    )
+    
+    col_norm, col_stage = st.columns(2)
+    with col_norm:
+        normalization_strategy = st.selectbox(
+            "Strategia normalizzazione",
+            options=[
+                "percentile_2_98",
+                "percentile_1_99",
+                "percentile_0.5_99.5",
+                "log",
+                "histogram_equalization",
+            ],
+            index=2,
+            format_func=lambda x: {
+                "percentile_2_98": "Percentili 2-98%",
+                "percentile_1_99": "Percentili 1-99%",
+                "percentile_0.5_99.5": "Percentili 0.5-99.5%",
+                "log": "Logaritmica",
+                "histogram_equalization": "Equalizzazione istogramma",
+            }[x],
+        )
+    
+    # Process all selected profiles
+    processed_data = []
+    for profile in selected_profiles:
+        pipeline = run_filter_pipeline_cb(profile.data, cfg)
+        
+        # Auto-select non-hilbert stage
+        stage_labels = [stage_name for stage_name, _ in pipeline]
+        default_idx = len(stage_labels) - 1
+        for idx in range(len(stage_labels) - 1, -1, -1):
+            if "hilbert" not in str(stage_labels[idx]).lower():
+                default_idx = idx
+                break
+        
+        filtered = pipeline[default_idx][1]
+        processed_data.append({
+            "profile": profile,
+            "pipeline": pipeline,
+            "filtered": filtered,
+            "stage_idx": default_idx,
+        })
+    
+    with col_stage:
+        stage_options = list(range(len(processed_data[0]["pipeline"])))
+        stage_labels = [s[0] for s in processed_data[0]["pipeline"]]
+        stage_index = st.selectbox(
+            "Stadio visualizzazione",
+            options=stage_options,
+            index=processed_data[0]["stage_idx"],
+            format_func=lambda i: stage_labels[i],
+        )
+    
+    # Update filtered data to selected stage
+    for item in processed_data:
+        item["filtered"] = item["pipeline"][stage_index][1]
+    
+    # Comparative statistics
+    with st.expander("📈 Statistiche Comparative", expanded=False):
+        stats_data = []
+        for item in processed_data:
+            p = item["profile"]
+            f = item["filtered"]
+            stats_data.append({
+                "Profilo": p.label,
+                "File": p.file_name,
+                "Canale": p.channel_index,
+                "Tracce": p.data.shape[0],
+                "Samples": p.data.shape[1],
+                "Std Raw": f"{np.nanstd(p.data):.2f}",
+                "Std Filtrato": f"{np.nanstd(f):.2f}",
+            })
+        st.dataframe(stats_data, use_container_width=True, hide_index=True)
+        
+        # Cross-correlation matrix
+        if len(processed_data) > 1:
+            st.markdown("**Matrice correlazione cross-profilo (dati filtrati)**")
+            n = len(processed_data)
+            corr_matrix = np.ones((n, n), dtype=np.float64)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    corr = _corr_flat(processed_data[i]["filtered"], processed_data[j]["filtered"])
+                    corr_matrix[i, j] = corr
+                    corr_matrix[j, i] = corr
+            
+            corr_df = {
+                "Profilo": [item["profile"].label for item in processed_data],
+            }
+            for j, item in enumerate(processed_data):
+                corr_df[item["profile"].label] = [f"{corr_matrix[i, j]:.3f}" for i in range(n)]
+            st.dataframe(corr_df, use_container_width=True, hide_index=True)
+    
+    # Visualization
+    if view_mode == "Side-by-side":
+        n_profiles = len(processed_data)
+        n_cols = min(n_profiles, 2)
+        n_rows = (n_profiles + 1) // 2
+        
+        fig = make_subplots(
+            rows=n_rows,
+            cols=n_cols,
+            subplot_titles=[item["profile"].label for item in processed_data],
+            vertical_spacing=0.15,
+            horizontal_spacing=0.1,
+        )
+        
+        for idx, item in enumerate(processed_data):
+            row = (idx // n_cols) + 1
+            col = (idx % n_cols) + 1
+            
+            axes_info = _get_profile_axes(item["profile"], y_axis_mode)
+            filtered_disp = normalize_for_display(item["filtered"], strategy=normalization_strategy)
+            
+            fig.add_trace(
+                go.Heatmap(
+                    z=filtered_disp.T,
+                    x=axes_info["x_vals"],
+                    y=axes_info["y_vals"],
+                    colorscale=viz.profile_filtered_scale,
+                    reversescale=viz.profile_reverse,
+                    showscale=(idx == 0),
+                ),
+                row=row,
+                col=col,
+            )
+            
+            fig.update_xaxes(title_text=axes_info["x_title"], row=row, col=col)
+            fig.update_yaxes(title_text=axes_info["y_title"], row=row, col=col, autorange="reversed")
+        
+        fig.update_layout(height=400 * n_rows, title_text="Comparazione Multi-Profilo")
+        st.plotly_chart(fig, use_container_width=True)
+    
+    else:  # Grid view
+        n_profiles = len(processed_data)
+        grid_size = int(np.ceil(np.sqrt(n_profiles)))
+        
+        fig = make_subplots(
+            rows=grid_size,
+            cols=grid_size,
+            subplot_titles=[item["profile"].label for item in processed_data],
+            vertical_spacing=0.1,
+            horizontal_spacing=0.08,
+        )
+        
+        for idx, item in enumerate(processed_data):
+            row = (idx // grid_size) + 1
+            col = (idx % grid_size) + 1
+            
+            axes_info = _get_profile_axes(item["profile"], y_axis_mode)
+            filtered_disp = normalize_for_display(item["filtered"], strategy=normalization_strategy)
+            
+            fig.add_trace(
+                go.Heatmap(
+                    z=filtered_disp.T,
+                    x=axes_info["x_vals"],
+                    y=axes_info["y_vals"],
+                    colorscale=viz.profile_filtered_scale,
+                    reversescale=viz.profile_reverse,
+                    showscale=False,
+                ),
+                row=row,
+                col=col,
+            )
+            
+            fig.update_xaxes(showticklabels=False, row=row, col=col)
+            fig.update_yaxes(autorange="reversed", showticklabels=False, row=row, col=col)
+        
+        fig.update_layout(height=200 * grid_size, title_text=f"Vista Griglia ({n_profiles} profili)")
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # Export batch
+    with st.expander("💾 Export Batch", expanded=False):
+        st.markdown("Esporta tutti i profili selezionati con filtri applicati.")
+        
+        if st.button("🚀 Genera ZIP con profili processati", key="export_batch"):
+            with st.spinner("Generazione export batch..."):
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for item in processed_data:
+                        profile = item["profile"]
+                        filtered = item["filtered"]
+                        base_name = f"{profile.file_name}_ch{profile.channel_index}"
+                        
+                        # Save PNG
+                        axes_info = _get_profile_axes(profile, y_axis_mode)
+                        filtered_disp = normalize_for_display(filtered, strategy=normalization_strategy)
+                        fig_export = go.Figure(
+                            data=go.Heatmap(
+                                z=filtered_disp.T,
+                                x=axes_info["x_vals"],
+                                y=axes_info["y_vals"],
+                                colorscale=viz.profile_filtered_scale,
+                                reversescale=viz.profile_reverse,
+                            )
+                        )
+                        fig_export.update_layout(
+                            title=profile.label,
+                            xaxis_title=axes_info["x_title"],
+                            yaxis_title=axes_info["y_title"],
+                        )
+                        fig_export.update_yaxes(autorange="reversed")
+                        img_bytes = fig_export.to_image(format="png", width=1200, height=800)
+                        zf.writestr(f"{base_name}.png", img_bytes)
+                        
+                        # Save metadata JSON
+                        metadata_export = {
+                            "label": profile.label,
+                            "file_name": profile.file_name,
+                            "channel_index": profile.channel_index,
+                            "shape": list(profile.data.shape),
+                            "metadata": profile.metadata,
+                            "processing_applied": [s[0] for s in item["pipeline"]],
+                        }
+                        zf.writestr(f"{base_name}_metadata.json", json.dumps(metadata_export, indent=2))
+                
+                zip_buffer.seek(0)
+                st.download_button(
+                    label="📥 Scarica ZIP",
+                    data=zip_buffer,
+                    file_name="gpr_batch_export.zip",
+                    mime="application/zip",
+                )
+
+
 def render_profile_tab(
     profiles: list[OgprProfile],
     cfg: Any,
@@ -193,7 +462,7 @@ def render_profile_tab(
     run_filter_pipeline_cb: Callable[[np.ndarray, Any], list[tuple[str, np.ndarray]]],
 ) -> None:
     mode_label = "Base consigliato" if cfg.workflow_mode == "base" else "Manuale"
-    st.caption(f"Modalita workflow: {mode_label}")
+    st.caption(f"Modalità workflow: {mode_label}")
     ordered_steps = ordered_processing_steps(cfg)
     if ordered_steps:
         st.caption("Workflow processing attivo: " + " -> ".join([f"{name}({order})" for name, order in ordered_steps]))
@@ -237,6 +506,8 @@ def render_profile_tab(
     profile_stds = [float(np.nanstd(profile.data)) for profile in profiles]
     rows = []
     for profile, pstd in zip(profiles, profile_stds):
+        validation = validate_metadata(profile)
+        antenna_str = validation.antenna_type if validation.antenna_type else "n/d"
         rows.append(
             {
                 "profilo": profile.label,
@@ -244,7 +515,8 @@ def render_profile_tab(
                 "campioni": int(profile.data.shape[1]),
                 "std": float(pstd),
                 "gps": "SI" if (profile.x is not None and profile.y is not None) else "NO",
-                "srs": _srs_label(profile),
+                "antenna": antenna_str,
+                "validità": f"{validation.completeness_score:.0%}",
             }
         )
     st.dataframe(rows, use_container_width=True, hide_index=True)
@@ -257,37 +529,53 @@ def render_profile_tab(
         format_func=lambda idx: profiles[idx].label,
     )
     selected = profiles[selected_idx]
-
-    ml_state_key = f"ml_preset::{selected.file_name}::{selected.channel_index}"
-    with st.expander("Preset ML automatico"):
-        st.caption(
-            "Il preset ML suggerisce soprattutto il workflow dei filtri. "
-            "I parametri tecnici (sample rate/band-pass) restano vincolati ai metadati OGPR quando disponibili."
+    
+    # Metadata validation display
+    validation = validate_metadata(selected)
+    if validation.is_valid:
+        st.success(
+            f"✅ Metadati validi (score: {validation.completeness_score:.0%})" +
+            (f" - **{validation.antenna_type}** rilevata ({validation.detected_frequency_mhz:.0f} MHz)" 
+             if validation.antenna_type else "")
         )
-        col_calc, col_reset = st.columns(2)
-        if col_calc.button("Calcola suggerimento ML", key=f"calc_ml_{selected_idx}"):
-            with st.spinner("Calcolo preset ML..."):
-                ml_idx, ml_conf = predict_ml_preset_cb(selected.data, sample_rate=cfg.sample_rate)
-            st.session_state[ml_state_key] = {"idx": int(ml_idx), "conf": float(ml_conf)}
-        if col_reset.button("Reset suggerimento", key=f"reset_ml_{selected_idx}"):
-            st.session_state.pop(ml_state_key, None)
+    else:
+        st.warning(
+            f"⚠️ Metadati incompleti (score: {validation.completeness_score:.0%})\n\n" +
+            "\n".join(f"- {w}" for w in validation.warnings)
+        )
 
-        ml_state = st.session_state.get(ml_state_key)
-        if isinstance(ml_state, dict):
-            ml_idx = int(ml_state.get("idx", 0))
-            ml_conf = float(ml_state.get("conf", 0.0))
-            ml_preset = auto_preset_library[ml_idx]
-            st.write(
-                {
-                    "preset_ml": ml_preset["name"],
-                    "confidence": round(ml_conf, 3),
-                }
+    # ML Preset - shown only if metadata valid
+    if validation.is_valid:
+        ml_state_key = f"ml_preset::{selected.file_name}::{selected.channel_index}"
+        with st.expander("🤖 Preset ML automatico", expanded=False):
+            st.caption(
+                "Il preset ML suggerisce soprattutto il workflow dei filtri. "
+                "I parametri tecnici (sample rate/band-pass) restano vincolati ai metadati OGPR quando disponibili."
             )
-            if st.button("Applica preset ML", key=f"apply_ml_preset_{selected_idx}"):
-                apply_preset_cb(ml_preset)
-                st.rerun()
-        else:
-            st.caption("Premi `Calcola suggerimento ML` solo quando vuoi il preset automatico.")
+            col_calc, col_reset = st.columns(2)
+            if col_calc.button("Calcola suggerimento ML", key=f"calc_ml_{selected_idx}"):
+                with st.spinner("Calcolo preset ML..."):
+                    ml_idx, ml_conf = predict_ml_preset_cb(selected.data, sample_rate=cfg.sample_rate)
+                st.session_state[ml_state_key] = {"idx": int(ml_idx), "conf": float(ml_conf)}
+            if col_reset.button("Reset suggerimento", key=f"reset_ml_{selected_idx}"):
+                st.session_state.pop(ml_state_key, None)
+
+            ml_state = st.session_state.get(ml_state_key)
+            if isinstance(ml_state, dict):
+                ml_idx = int(ml_state.get("idx", 0))
+                ml_conf = float(ml_state.get("conf", 0.0))
+                ml_preset = auto_preset_library[ml_idx]
+                st.write(
+                    {
+                        "preset_ml": ml_preset["name"],
+                        "confidence": round(ml_conf, 3),
+                    }
+                )
+                if st.button("Applica preset ML", key=f"apply_ml_preset_{selected_idx}"):
+                    apply_preset_cb(ml_preset)
+                    st.rerun()
+            else:
+                st.caption("Premi `Calcola suggerimento ML` per ottenere un preset ottimizzato.")
 
     axes_info = _get_profile_axes(selected, y_axis_mode)
 
@@ -337,7 +625,7 @@ def render_profile_tab(
             "Lo stadio filtrato selezionato ha una dinamica molto ridotta rispetto al raw. "
             "Controlla i passaggi nel pannello diagnostica filtri."
         )
-    with st.expander("Diagnostica orientamento (tempo)"):
+    with st.expander("🩺 Diagnostica orientamento (tempo)", expanded=False):
         ns = selected.data.shape[1]
         nwin = max(8, int(round(0.10 * ns)))
         early_raw = float(np.nanmean(np.abs(selected.data[:, :nwin])))
@@ -358,17 +646,18 @@ def render_profile_tab(
         )
         if ratio_raw > 3.0:
             st.warning(
-                "Nel RAW l'energia e concentrata nel fondo traccia (late >> early). "
-                "Questo indica piu spesso t0/layout/artefatto filtri che semplice inversione asse."
+                "Nel RAW l'energia è concentrata nel fondo traccia (late >> early). "
+                "Questo indica più spesso t0/layout/artefatto filtri che semplice inversione asse."
             )
         elif ratio_raw < 0.33:
-            st.info("Nel RAW l'energia e maggiore all'inizio traccia (comportamento spesso atteso vicino a t0).")
+            st.info("Nel RAW l'energia è maggiore all'inizio traccia (comportamento spesso atteso vicino a t0).")
         else:
             st.info("Distribuzione energetica RAW abbastanza bilanciata lungo il tempo.")
 
-    reverse_default = ("Profondit" in axes_info["y_title"]) or ("Tempo" in axes_info["y_title"])
+    reverse_default = ("Profondità" in axes_info["y_title"]) or ("Tempo" in axes_info["y_title"])
     reverse_y = (not reverse_default) if bool(y_flip_debug) else reverse_default
-    with st.expander("Diagnostica filtri (step-by-step)"):
+    
+    with st.expander("🔬 Diagnostica filtri (step-by-step)", expanded=False):
         stats_rows = []
         for step_name, step_data in pipeline:
             stats_rows.append(
@@ -381,7 +670,8 @@ def render_profile_tab(
                 }
             )
         st.dataframe(stats_rows, use_container_width=True, hide_index=True)
-    with st.expander("Spettro ampiezza (makeAmpspec)"):
+    
+    with st.expander("📊 Spettro ampiezza (makeAmpspec)", expanded=False):
         f_raw, a_raw = make_amplitude_spectrum(selected.data, sample_rate=float(cfg.sample_rate))
         f_flt, a_flt = make_amplitude_spectrum(filtered, sample_rate=float(cfg.sample_rate))
         if f_raw.size > 0 and a_raw.size > 0 and f_flt.size > 0 and a_flt.size > 0:
@@ -410,7 +700,8 @@ def render_profile_tab(
             st.plotly_chart(fig_spec, use_container_width=True)
         else:
             st.caption("Spettro non disponibile per questo profilo.")
-    with st.expander("Dettagli parser profilo"):
+    
+    with st.expander("🔍 Dettagli parser profilo", expanded=False):
         st.json(selected.metadata)
 
     traces_count, samples_count = selected.data.shape
@@ -449,7 +740,7 @@ def render_profile_tab(
         filtered_disp = normalize_for_display(filtered, strategy=normalization_strategy)
 
     diff = np.asarray(filtered, dtype=np.float64) - np.asarray(selected.data, dtype=np.float64)
-    with st.expander("Verifica applicazione filtri"):
+    with st.expander("✓ Verifica applicazione filtri", expanded=False):
         st.write(
             {
                 "std_raw": float(np.nanstd(selected.data)),
@@ -570,6 +861,9 @@ def render_profile_tab(
     st.plotly_chart(ascan_fig, use_container_width=True)
 
 
+# ... (rest of timeslice code remains the same, keeping it from previous version)
+# Keeping the existing timeslice functions to avoid breaking changes
+
 def _collect_timeslice_points(
     profiles: list[OgprProfile],
     arrays: list[np.ndarray],
@@ -679,7 +973,6 @@ def _idw_interpolate_grid(
     if r > 0:
         neighbors = tree.query_ball_point(q, r=r)
     else:
-        # Fallback nearest if radius non valido
         dist, idx = tree.query(q, k=1)
         out = vals[idx]
         out[~np.isfinite(dist)] = np.nan
@@ -763,7 +1056,7 @@ def _coherence_map_for_sample(
             continue
         pts = np.column_stack((xk, yk))
         slices.append(_interpolate_grid(pts, vk, grid_x, grid_y, method, idw_radius, idw_power))
-    cube = np.stack(slices, axis=0)  # [t, y, x]
+    cube = np.stack(slices, axis=0)
 
     ny, nx = grid_x.shape
     coh = np.full((ny, nx), np.nan, dtype=np.float64)
@@ -834,7 +1127,7 @@ def render_timeslice_tab(
     apply_filters_cb: Callable[[np.ndarray, Any], np.ndarray],
 ) -> None:
     mode_label = "Base consigliato" if cfg.workflow_mode == "base" else "Manuale"
-    st.caption(f"Modalita workflow: {mode_label}")
+    st.caption(f"Modalità workflow: {mode_label}")
     ordered_steps = ordered_processing_steps(cfg)
     if ordered_steps:
         st.caption("Ordine processing: " + " -> ".join([f"{name}({order})" for name, order in ordered_steps]))
@@ -842,7 +1135,7 @@ def render_timeslice_tab(
     use_filtered = st.checkbox("Usa dati filtrati per la time-slice", value=True)
     map_mode = st.selectbox("Mappa", options=["ampiezza", "coherence"], index=0)
     method = st.selectbox("Interpolazione", options=["linear", "nearest", "cubic", "idw"], index=0)
-    idw_radius = st.number_input("IDW raggio (m/unita XY)", min_value=0.0, value=0.0, step=0.1, disabled=method != "idw")
+    idw_radius = st.number_input("IDW raggio (m/unità XY)", min_value=0.0, value=0.0, step=0.1, disabled=method != "idw")
     idw_power = st.slider("IDW power", min_value=1.0, max_value=5.0, value=2.0, step=0.1, disabled=method != "idw")
     grid_size = st.slider("Risoluzione griglia", min_value=50, max_value=400, value=180, step=10)
     show_points = st.checkbox("Mostra punti campionati", value=True)
@@ -862,7 +1155,8 @@ def render_timeslice_tab(
         step=10.0,
         disabled=map_mode != "coherence",
     )
-    with st.expander("Processing 3D cube (MATLAB-like)", expanded=False):
+    
+    with st.expander("⚙️ Processing 3D cube (MATLAB-like)", expanded=False):
         use_cube_processing = st.checkbox(
             "Abilita processing 3D cube su time-slice",
             value=False,
@@ -1026,7 +1320,6 @@ def render_timeslice_tab(
                         factor=float(cube_resample_factor),
                         time_axis=0,
                     )
-                    # aggiorna gli indici sample reali lungo asse tempo
                     old_idx = sample_indices.astype(np.float64)
                     nt_new = cube.shape[0]
                     if float(cube_resample_factor) > 1.0:
@@ -1084,7 +1377,7 @@ def render_timeslice_tab(
                 cube_grid = cube_slice
                 if display_sample_idx != int(sample_idx):
                     st.caption(
-                        f"Time-slice visualizzata al sample {display_sample_idx} (piu vicino a {sample_idx} con riduzione n={step})."
+                        f"Time-slice visualizzata al sample {display_sample_idx} (più vicino a {sample_idx} con riduzione n={step})."
                     )
                     x2, y2, v2, o2, _gps2 = _collect_timeslice_points(
                         profiles,
