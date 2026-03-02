@@ -1,0 +1,79 @@
+                                                1
+
+
+
+
+         GPR-SLICE V7.MT
+Ground Penetrating Radar Imaging Software
+
+
+
+
+           User’s Manual
+                20014 Gypsy Ln
+            Woodland Hills, CA 91364
+             dean@gpr-survey.com
+
+
+
+
+            last updated (September 14, 2021)
+
+
+                                                1
+                                                                                                                  18
+
+
+Step 2. Transfer Data
+
+� Import Data to Project: C:\GPR projects\treasure\ :complete                                                      □       X
+                                                                                                              41 files found
+
+ filename                                                                                1 size (kb)
+ 37RD41.DT1                                                                                 106128
+ 37RD41.HD                                                                                  600
+ 37RD42.DT1                                                                                 106128
+ 37RD42.HD                                                                                  596
+ 37RD43.DT1                                                                                 106128
+
+
+               1**
+                                                                2
+ file type                                      iJ                  search   I          append identifier
+
+               1 C:\kisatchie\freshman\raw                                   11                                           13
+                                                                1
+ start from:                                                        browse        import radargram data to \raw\ folder
+
+
+
+
+    After completing steps 1 the user needs to import data into the GPR­
+SLICE project folder. The transfer data option available in the Files menu
+is operated by:
+
+1) Click the Browse button to locate the root of the folder where the raw
+   GPR data reside
+
+2) Click the Search button to display the files into the dialog (optional)
+
+3) Click the Import radargram data to \raw\folder button to begin
+   transferring the raw data into the project.
+
+Note: There is an option to import all the files from a survey with an
+Append identifier in the Transfer Data menu. This is useful when multiple
+grids nearby are to be combined into a single comprehensive process but
+when the separate grids might have the same filenames and unique
+names are needed.
+
+
+
+
+                                                                                                                  18
+NB
+TID: info600y.dat (Selezionare verso delle Y)
+LID: info600x.dat (Selezionare verso delle X)
+
+Time windows ns: 64
+samples/scan: 512
+

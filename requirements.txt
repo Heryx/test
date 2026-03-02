@@ -1,0 +1,6 @@
+streamlit>=1.41.0
+numpy>=2.1.0
+scipy>=1.15.0
+h5py>=3.12.0
+plotly>=5.24.0
+scikit-learn>=1.4.0
