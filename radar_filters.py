@@ -116,15 +116,64 @@ def _time_axis_3d(cube: np.ndarray, time_axis: int = 0) -> int:
     return axis
 
 
-def normalize_for_display(data: np.ndarray) -> np.ndarray:
+def normalize_for_display(data: np.ndarray, strategy: str = "percentile_2_98") -> np.ndarray:
+    """Normalizza dati per visualizzazione con diverse strategie.
+    
+    Strategie disponibili:
+    - 'percentile_2_98': Percentili 2-98% (default, conservativo)
+    - 'percentile_1_99': Percentili 1-99% (piu robusto)
+    - 'percentile_0.5_99.5': Percentili 0.5-99.5% (molto robusto)
+    - 'log': Normalizzazione logaritmica (per segnali con gain)
+    - 'histogram_equalization': Equalizzazione istogramma (massimo contrasto)
+    """
     arr = np.asarray(data, dtype=np.float64)
     finite = np.isfinite(arr)
     if not finite.any():
         return np.zeros_like(arr)
 
     vals = arr[finite]
-    vmin = np.nanpercentile(vals, 2)
-    vmax = np.nanpercentile(vals, 98)
+    strategy_norm = str(strategy).lower()
+
+    if strategy_norm == "percentile_1_99":
+        vmin = np.nanpercentile(vals, 1)
+        vmax = np.nanpercentile(vals, 99)
+    elif strategy_norm == "percentile_0.5_99.5":
+        vmin = np.nanpercentile(vals, 0.5)
+        vmax = np.nanpercentile(vals, 99.5)
+    elif strategy_norm == "log":
+        # Logaritmica: utile per segnali con gain esponenziale
+        abs_vals = np.abs(vals)
+        abs_vals_nz = abs_vals[abs_vals > 0]
+        if abs_vals_nz.size == 0:
+            return np.zeros_like(arr)
+        vmin_abs = np.nanpercentile(abs_vals_nz, 1)
+        vmax_abs = np.nanpercentile(abs_vals_nz, 99)
+        if vmin_abs <= 0:
+            vmin_abs = np.nanmin(abs_vals_nz[abs_vals_nz > 0])
+        arr_log = np.sign(arr) * np.log10(np.maximum(np.abs(arr), vmin_abs))
+        vmin = np.log10(vmin_abs)
+        vmax = np.log10(vmax_abs)
+        if np.isclose(vmin, vmax):
+            return np.zeros_like(arr)
+        clipped = np.clip(arr_log, vmin, vmax)
+        return (clipped - vmin) / (vmax - vmin)
+    elif strategy_norm == "histogram_equalization":
+        # Equalizzazione istogramma: massimizza il contrasto
+        n_bins = 2048
+        hist, bin_edges = np.histogram(vals, bins=n_bins)
+        cdf = hist.cumsum()
+        cdf_normalized = cdf / cdf[-1]
+        # Interpolazione per mappare i valori originali sulla CDF normalizzata
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        equalized = np.interp(arr.ravel(), bin_centers, cdf_normalized)
+        equalized = equalized.reshape(arr.shape)
+        equalized[~finite] = 0.0
+        return equalized
+    else:  # default: percentile_2_98
+        vmin = np.nanpercentile(vals, 2)
+        vmax = np.nanpercentile(vals, 98)
+
+    # Fallback se vmin == vmax
     if np.isclose(vmin, vmax):
         vmin = np.nanpercentile(vals, 0.1)
         vmax = np.nanpercentile(vals, 99.9)
@@ -133,6 +182,7 @@ def normalize_for_display(data: np.ndarray) -> np.ndarray:
         vmax = float(np.nanmax(vals))
     if np.isclose(vmin, vmax):
         return np.zeros_like(arr)
+    
     clipped = np.clip(arr, vmin, vmax)
     return (clipped - vmin) / (vmax - vmin)
 

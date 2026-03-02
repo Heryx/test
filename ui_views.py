@@ -214,6 +214,26 @@ def render_profile_tab(
         help="Usalo solo per capire se la geometria appare capovolta.",
     )
 
+    normalization_strategy = st.selectbox(
+        "Strategia normalizzazione colori",
+        options=[
+            "percentile_2_98",
+            "percentile_1_99",
+            "percentile_0.5_99.5",
+            "log",
+            "histogram_equalization",
+        ],
+        index=2,
+        format_func=lambda x: {
+            "percentile_2_98": "Percentili 2-98% (conservativo)",
+            "percentile_1_99": "Percentili 1-99% (robusto)",
+            "percentile_0.5_99.5": "Percentili 0.5-99.5% (molto robusto)",
+            "log": "Logaritmica (per gain esponenziale)",
+            "histogram_equalization": "Equalizzazione istogramma (max contrasto)",
+        }[x],
+        help="Cambia la strategia di normalizzazione per migliorare la visualizzazione. Prova 'Percentili 0.5-99.5%' o 'Logaritmica' se il radargramma appare uniforme.",
+    )
+
     profile_stds = [float(np.nanstd(profile.data)) for profile in profiles]
     rows = []
     for profile, pstd in zip(profiles, profile_stds):
@@ -416,8 +436,8 @@ def render_profile_tab(
     )
     shared_scale = st.checkbox(
         "Scala colore condivisa raw/filtrato (debug filtri)",
-        value=True,
-        help="Usa la stessa scala sul grezzo e sul filtrato per rendere visibili le differenze reali.",
+        value=False,
+        help="Usa la stessa scala sul grezzo e sul filtrato per rendere visibili le differenze reali. DISATTIVALO se i radargrammi appaiono uniformi.",
     )
 
     if shared_scale:
@@ -425,8 +445,8 @@ def render_profile_tab(
         raw_disp = _normalize_with_fixed_bounds(selected.data, vmin, vmax)
         filtered_disp = _normalize_with_fixed_bounds(filtered, vmin, vmax)
     else:
-        raw_disp = normalize_for_display(selected.data)
-        filtered_disp = normalize_for_display(filtered)
+        raw_disp = normalize_for_display(selected.data, strategy=normalization_strategy)
+        filtered_disp = normalize_for_display(filtered, strategy=normalization_strategy)
 
     diff = np.asarray(filtered, dtype=np.float64) - np.asarray(selected.data, dtype=np.float64)
     with st.expander("Verifica applicazione filtri"):
